@@ -1,0 +1,2586 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d213ee3..7f0e522 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,8 +47,10 @@ target_sources(xsystem4 PRIVATE
+   src/audio_meta.c
+   src/audio_mixer.c
+   src/asset_manager.c
++  src/android_jni.c
+   src/base64.c
+   src/cJSON.c
++  src/cheat.c
+   src/draw.c
+   src/effect.c
+   src/ffi.c
+@@ -72,6 +74,7 @@ target_sources(xsystem4 PRIVATE
+   src/swf.c
+   src/system4.c
+   src/text.c
++  src/upscale.c
+   src/util.c
+   src/video.c
+   src/vm.c
+diff --git a/include/cheat.h b/include/cheat.h
+new file mode 100644
+index 0000000..16910aa
+--- /dev/null
++++ b/include/cheat.h
+@@ -0,0 +1,98 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#ifndef SYSTEM4_CHEAT_H
++#define SYSTEM4_CHEAT_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * A small "cheat engine" for the game's VM: it can search the VM's variables
++ * (globals, struct members, array elements) for values, change them, and
++ * freeze them.
++ *
++ * Threading: the VM runs on the game thread. The functions in the first group
++ * are called by the game thread; they hand the VM over at safe points (while
++ * pumping events or sleeping) so that the functions in the second group,
++ * which are called from other threads (the Android UI thread), can inspect
++ * and modify VM memory without racing against the interpreter.
++ */
++
++/* Game thread */
++void cheat_init(void);           // called once when the VM starts
++void cheat_vm_reset(void);       // VM state was re-initialized; drop all addresses
++void cheat_safepoint_begin(void);
++void cheat_safepoint_end(void);
++
++/* Other threads */
++bool cheat_is_ready(void);  // has the VM started?
++
++enum cheat_result {
++	CHEAT_OK        =  0,
++	CHEAT_BUSY      = -1,  // the VM did not reach a safe point in time
++	CHEAT_NOT_READY = -2,  // the VM has not started yet
++	CHEAT_STALE     = -3,  // the variable no longer exists
++	CHEAT_BAD_VALUE = -4,  // the value could not be parsed
++	CHEAT_BAD_TYPE  = -5,
++	CHEAT_FULL      = -6,
++	CHEAT_NO_SCAN   = -7,  // no scan in progress
++	CHEAT_TRUNCATED = -8,  // (informational) result list was cut short
++};
++
++enum cheat_kind {
++	CHEAT_INT   = 0,
++	CHEAT_FLOAT = 1,
++	CHEAT_BOOL  = 2,
++};
++
++enum cheat_scan_type {
++	CHEAT_SCAN_INT   = 0,
++	CHEAT_SCAN_FLOAT = 1,
++};
++
++enum cheat_cmp {
++	CHEAT_CMP_EXACT     = 0,
++	CHEAT_CMP_UNKNOWN   = 1,  // first scan only: keep every value
++	CHEAT_CMP_GREATER   = 2,
++	CHEAT_CMP_LESS      = 3,
++	CHEAT_CMP_CHANGED   = 4,  // next scan only
++	CHEAT_CMP_UNCHANGED = 5,
++	CHEAT_CMP_INCREASED = 6,
++	CHEAT_CMP_DECREASED = 7,
++};
++
++#define CHEAT_SCAN_INCLUDE_LOCALS 1
++
++// Returns the number of matches (>= 0) or a negative cheat_result.
++int cheat_scan_first(int type, int cmp, const char *value, int flags);
++int cheat_scan_next(int cmp, const char *value);
++void cheat_scan_reset(void);
++bool cheat_scan_truncated(void);
++
++// The following fill BUF with tab separated lines
++//   slot, index, seq, kind, frozen, value, label
++// and return the number of bytes used, or a negative cheat_result.
++int cheat_scan_results(int offset, int limit, char *buf, size_t size);
++int cheat_browse(const char *filter, int limit, char *buf, size_t size);
++int cheat_frozen_list(char *buf, size_t size);
++
++int cheat_write(int32_t slot, int32_t index, uint32_t seq, int kind, const char *value);
++int cheat_freeze(int32_t slot, int32_t index, uint32_t seq, int kind, const char *value,
++		 const char *label, bool enable);
++
++#endif /* SYSTEM4_CHEAT_H */
+diff --git a/include/gfx/gfx.h b/include/gfx/gfx.h
+index 3ae2abc..4efd0c7 100644
+--- a/include/gfx/gfx.h
++++ b/include/gfx/gfx.h
+@@ -18,6 +18,7 @@
+ #define SYSTEM4_GFX_CORE_H
+ 
+ #include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+ #include <SDL.h>
+ #include "gfx/gl.h"
+@@ -86,6 +87,7 @@ float gfx_get_frame_rate(void);
+ 
+ void gfx_load_shader(struct shader *dst, const char *vertex_shader_path, const char *fragment_shader_path);
+ GLuint gfx_load_shader_file(const char *path, GLenum type, const char *defines);
++bool gfx_try_load_shader(struct shader *dst, const char *vertex_shader_path, const char *fragment_shader_path, char *err, size_t errlen);
+ 
+ // rendering
+ void gfx_set_clear_color(int r, int g, int b, int a);
+diff --git a/include/upscale.h b/include/upscale.h
+new file mode 100644
+index 0000000..f779b8b
+--- /dev/null
++++ b/include/upscale.h
+@@ -0,0 +1,68 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#ifndef SYSTEM4_UPSCALE_H
++#define SYSTEM4_UPSCALE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include "gfx/gl.h"
++
++struct texture;
++
++/*
++ * Optional spatial upscaling of the game surface to the screen.
++ *
++ * The game always renders at its fixed logical resolution (main_surface).
++ * When an upscaler is enabled, gfx_swap() first runs it on that surface and
++ * then stretches the result to the window, instead of stretching the raw
++ * surface with plain bilinear filtering.
++ */
++
++enum upscale_mode {
++	UPSCALE_OFF  = 0,
++	UPSCALE_FSR  = 1,  // AMD FidelityFX Super Resolution 1.0 (EASU + RCAS)
++	UPSCALE_SGSR = 2,  // Snapdragon Game Super Resolution 1.0
++	NR_UPSCALE_MODES
++};
++
++enum upscale_quality {
++	UPSCALE_ULTRA_QUALITY = 0,
++	UPSCALE_QUALITY       = 1,
++	UPSCALE_BALANCED      = 2,
++	UPSCALE_PERFORMANCE   = 3,
++	NR_UPSCALE_QUALITIES
++};
++
++// Thread-safe; may be called from any thread (e.g. the Android UI thread).
++void upscale_set(int mode, int quality);
++void upscale_get(int *mode, int *quality);
++
++bool upscale_parse_mode(const char *s, int *mode);
++bool upscale_parse_quality(const char *s, int *quality);
++
++/*
++ * Run the selected upscaler on SRC for a screen viewport of vp_w x vp_h.
++ * Returns the handle of a texture holding the result (to be drawn like the
++ * source), or 0 if upscaling is off, not applicable, or unavailable; in that
++ * case the caller draws SRC as usual. Must be called on the GL thread.
++ */
++GLuint upscale_process(struct texture *src, int vp_w, int vp_h);
++
++// Human readable description of what the upscaler is doing (UTF-8).
++void upscale_status(char *buf, size_t size);
++
++#endif /* SYSTEM4_UPSCALE_H */
+diff --git a/licenses/FidelityFX-FSR.txt b/licenses/FidelityFX-FSR.txt
+new file mode 100644
+index 0000000..324cba5
+--- /dev/null
++++ b/licenses/FidelityFX-FSR.txt
+@@ -0,0 +1,19 @@
++Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
+diff --git a/licenses/SnapdragonGSR.txt b/licenses/SnapdragonGSR.txt
+new file mode 100644
+index 0000000..d9d513c
+--- /dev/null
++++ b/licenses/SnapdragonGSR.txt
+@@ -0,0 +1,29 @@
++Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
++
++Redistribution and use in source and binary forms, with or without
++modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice,
++   this list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++   without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++POSSIBILITY OF SUCH DAMAGE.
++
++SPDX-License-Identifier: BSD-3-Clause
+\ No newline at end of file
+diff --git a/shaders/fsr_easu.f.glsl b/shaders/fsr_easu.f.glsl
+new file mode 100644
+index 0000000..b910caa
+--- /dev/null
++++ b/shaders/fsr_easu.f.glsl
+@@ -0,0 +1,207 @@
++/* AMD FidelityFX Super Resolution 1.0 -- EASU (Edge Adaptive Spatial Upsampling)
++ *
++ * GLSL ES 3.00 port of the float (non-packed) EASU path from ffx_fsr1.h
++ * (FidelityFX-FSR v1.20210629).
++ *
++ *   Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
++ *   Distributed under the MIT License, see licenses/FidelityFX-FSR.txt.
++ *
++ * Changes from the reference implementation:
++ *  - textureGather() is not available in ES 3.00, so the 12 taps are read
++ *    with texelFetch() (clamped to the texture edge). The gather lane
++ *    layout of the reference has been resolved to explicit tap offsets.
++ *  - Where the reference leaves division by zero to the hardware, the
++ *    argument is guarded. On GLSL ES 3.00 (and GLSL >= 3.30) the reference's
++ *    bit-trick reciprocal / reciprocal-sqrt approximations are used, so the
++ *    output is identical to the reference; older desktop GLSL (1.40, which
++ *    lacks floatBitsToUint) falls back to exact guarded versions.
++ */
++
++uniform highp sampler2D tex;
++uniform vec2 u_src_size;   // size of the input texture in texels
++uniform vec2 u_out_size;   // size of the render target in pixels
++
++in vec2 tex_coord;
++out vec4 frag_color;
++
++// APrxLoRcpF1() / APrxLoRsqF1() from ffx_a.h.
++#if __VERSION__ >= 300
++float prx_rcp(float a) { return uintBitsToFloat(0x7ef07ebbu - floatBitsToUint(a)); }
++float prx_rsq(float a) { return uintBitsToFloat(0x5f347d74u - (floatBitsToUint(a) >> 1u)); }
++#else
++float prx_rcp(float a) { return 1.0 / max(a, 1.0e-10); }
++float prx_rsq(float a) { return inversesqrt(max(a, 1.0e-10)); }
++#endif
++
++vec3 fetch_rgb(ivec2 p)
++{
++        ivec2 hi = ivec2(u_src_size) - ivec2(1);
++        return texelFetch(tex, clamp(p, ivec2(0), hi), 0).rgb;
++}
++
++// Luma times 2, in 2 FMA/MAD.
++float luma2(vec3 c)
++{
++        return c.b * 0.5 + (c.r * 0.5 + c.g);
++}
++
++// Filtering for a given tap for the scalar.
++void easu_tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len,
++              float lob, float clp, vec3 c)
++{
++        // Rotate offset by direction.
++        vec2 v;
++        v.x = (off.x * ( dir.x)) + (off.y * dir.y);
++        v.y = (off.x * (-dir.y)) + (off.y * dir.x);
++        // Anisotropy.
++        v *= len;
++        // Compute distance^2.
++        float d2 = v.x * v.x + v.y * v.y;
++        // Limit to the window as at corner, 2 taps can easily be outside.
++        d2 = min(d2, clp);
++        // Approximation of lanczos2 without sin() or rcp(), or sqrt() to get x.
++        float wB = 2.0 / 5.0 * d2 - 1.0;
++        float wA = lob * d2 - 1.0;
++        wB *= wB;
++        wA *= wA;
++        wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
++        float w = wB * wA;
++        // Do weighted average.
++        aC += c * w;
++        aW += w;
++}
++
++// Accumulate direction and length.
++void easu_set(inout vec2 dir, inout float len, vec2 pp,
++              bool biS, bool biT, bool biU, bool biV,
++              float lA, float lB, float lC, float lD, float lE)
++{
++        // Compute bilinear weight.
++        //  s t
++        //  u v
++        float w = 0.0;
++        if (biS) w = (1.0 - pp.x) * (1.0 - pp.y);
++        if (biT) w =        pp.x  * (1.0 - pp.y);
++        if (biU) w = (1.0 - pp.x) *        pp.y;
++        if (biV) w =        pp.x  *        pp.y;
++        // Direction is the '+' diff.
++        //    a
++        //  b c d
++        //    e
++        // Then takes magnitude from abs average of both sides of 'c'.
++        float dc = lD - lC;
++        float cb = lC - lB;
++        float lenX = max(abs(dc), abs(cb));
++        lenX = prx_rcp(lenX);
++        float dirX = lD - lB;
++        dir.x += dirX * w;
++        lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
++        lenX *= lenX;
++        len += lenX * w;
++        // Repeat for the y axis.
++        float ec = lE - lC;
++        float ca = lC - lA;
++        float lenY = max(abs(ec), abs(ca));
++        lenY = prx_rcp(lenY);
++        float dirY = lE - lA;
++        dir.y += dirY * w;
++        lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
++        lenY *= lenY;
++        len += lenY * w;
++}
++
++void main()
++{
++        // Integer pixel position in the output.
++        ivec2 ip = ivec2(floor(tex_coord * u_out_size));
++
++        // Get position of 'f'.
++        vec2 scale = u_src_size / u_out_size;
++        vec2 pp = vec2(ip) * scale + (0.5 * scale - 0.5);
++        vec2 fp = floor(pp);
++        pp -= fp;
++        ivec2 f0 = ivec2(fp);
++
++        // 12-tap kernel.
++        //    b c
++        //  e f g h
++        //  i j k l
++        //    n o
++        vec3 cB = fetch_rgb(f0 + ivec2( 0, -1));
++        vec3 cC = fetch_rgb(f0 + ivec2( 1, -1));
++        vec3 cE = fetch_rgb(f0 + ivec2(-1,  0));
++        vec3 cF = fetch_rgb(f0 + ivec2( 0,  0));
++        vec3 cG = fetch_rgb(f0 + ivec2( 1,  0));
++        vec3 cH = fetch_rgb(f0 + ivec2( 2,  0));
++        vec3 cI = fetch_rgb(f0 + ivec2(-1,  1));
++        vec3 cJ = fetch_rgb(f0 + ivec2( 0,  1));
++        vec3 cK = fetch_rgb(f0 + ivec2( 1,  1));
++        vec3 cL = fetch_rgb(f0 + ivec2( 2,  1));
++        vec3 cN = fetch_rgb(f0 + ivec2( 0,  2));
++        vec3 cO = fetch_rgb(f0 + ivec2( 1,  2));
++
++        float bL = luma2(cB), cLm = luma2(cC), eL = luma2(cE), fL = luma2(cF);
++        float gL = luma2(cG), hL = luma2(cH), iL = luma2(cI), jL = luma2(cJ);
++        float kL = luma2(cK), lL = luma2(cL), nL = luma2(cN), oL = luma2(cO);
++
++        // Accumulate for bilinear interpolation.
++        vec2 dir = vec2(0.0);
++        float len = 0.0;
++        easu_set(dir, len, pp, true,  false, false, false, bL,  eL, fL, gL, jL);
++        easu_set(dir, len, pp, false, true,  false, false, cLm, fL, gL, hL, kL);
++        easu_set(dir, len, pp, false, false, true,  false, fL,  iL, jL, kL, nL);
++        easu_set(dir, len, pp, false, false, false, true,  gL,  jL, kL, lL, oL);
++
++        // Normalize, and cleanup close to zero.
++        vec2 dir2 = dir * dir;
++        float dirR = dir2.x + dir2.y;
++        bool zro = dirR < (1.0 / 32768.0);
++        dirR = prx_rsq(dirR);
++        dirR = zro ? 1.0 : dirR;
++        dir.x = zro ? 1.0 : dir.x;
++        dir *= vec2(dirR);
++
++        // Transform from {0 to 2} to {0 to 1} range, and shape with square.
++        len = len * 0.5;
++        len *= len;
++
++        // Stretch kernel {1.0 vert|horz, to sqrt(2.0) on diagonal}.
++        float stretch = (dir.x * dir.x + dir.y * dir.y)
++                      * prx_rcp(max(abs(dir.x), abs(dir.y)));
++
++        // Anisotropic length after rotation,
++        //  x := 1.0 lerp to 'stretch' on edges
++        //  y := 1.0 lerp to 2x on edges
++        vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 + (-0.5) * len);
++
++        // Based on the amount of 'edge', the window shifts from
++        // +/-{sqrt(2.0) to slightly beyond 2.0}.
++        float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
++
++        // Set distance^2 clipping point to the end of the adjustable window.
++        float clp = prx_rcp(lob);
++
++        // Accumulation mixed with min/max of 4 nearest (f, g, j, k).
++        vec3 min4 = min(min(min(cF, cG), cJ), cK);
++        vec3 max4 = max(max(max(cF, cG), cJ), cK);
++
++        // Accumulation.
++        vec3 aC = vec3(0.0);
++        float aW = 0.0;
++        easu_tap(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, cB);
++        easu_tap(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, cC);
++        easu_tap(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, cI);
++        easu_tap(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, cJ);
++        easu_tap(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, cF);
++        easu_tap(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, cE);
++        easu_tap(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, cK);
++        easu_tap(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, cL);
++        easu_tap(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, cH);
++        easu_tap(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, cG);
++        easu_tap(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, cO);
++        easu_tap(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, cN);
++
++        // Normalize and dering.
++        vec3 pix = min(max4, max(min4, aC * (1.0 / aW)));
++        frag_color = vec4(pix, 1.0);
++}
+diff --git a/shaders/fsr_rcas.f.glsl b/shaders/fsr_rcas.f.glsl
+new file mode 100644
+index 0000000..f75fcad
+--- /dev/null
++++ b/shaders/fsr_rcas.f.glsl
+@@ -0,0 +1,61 @@
++/* AMD FidelityFX Super Resolution 1.0 -- RCAS (Robust Contrast Adaptive Sharpening)
++ *
++ * GLSL ES 3.00 port of the float (non-packed) RCAS path from ffx_fsr1.h
++ * (FidelityFX-FSR v1.20210629).
++ *
++ *   Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
++ *   Distributed under the MIT License, see licenses/FidelityFX-FSR.txt.
++ *
++ * Changes from the reference implementation:
++ *  - The divisions that the reference leaves to hardware NaN semantics of
++ *    min()/max() (0*inf on black or white neighbourhoods) are guarded so the
++ *    result is well defined on every GPU.
++ *  - The optional denoise path is not included.
++ */
++
++uniform highp sampler2D tex;
++uniform vec2 u_src_size;    // size of the input texture (== render target)
++uniform float u_sharpness;  // linear sharpness: exp2(-stops), 1.0 = maximum
++
++in vec2 tex_coord;
++out vec4 frag_color;
++
++// This is set at the limit of providing unnatural results for sharpening.
++const float FSR_RCAS_LIMIT = 0.25 - (1.0 / 16.0);
++
++vec3 load_rgb(ivec2 p)
++{
++        ivec2 hi = ivec2(u_src_size) - ivec2(1);
++        return texelFetch(tex, clamp(p, ivec2(0), hi), 0).rgb;
++}
++
++void main()
++{
++        // Algorithm uses minimal 3x3 pixel neighborhood.
++        //    b
++        //  d e f
++        //    h
++        ivec2 sp = ivec2(floor(tex_coord * u_src_size));
++        vec3 b = load_rgb(sp + ivec2( 0, -1));
++        vec3 d = load_rgb(sp + ivec2(-1,  0));
++        vec3 e = load_rgb(sp);
++        vec3 f = load_rgb(sp + ivec2( 1,  0));
++        vec3 h = load_rgb(sp + ivec2( 0,  1));
++
++        // Min and max of ring.
++        vec3 mn4 = min(min(min(b, d), f), h);
++        vec3 mx4 = max(max(max(b, d), f), h);
++
++        // Limiters.
++        vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0e-6));
++        vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1.0e-6));
++        vec3 lobeRGB = max(-hitMin, hitMax);
++        float lobe = max(-FSR_RCAS_LIMIT,
++                         min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0))
++                   * u_sharpness;
++
++        // Resolve.
++        float rcpL = 1.0 / (4.0 * lobe + 1.0);
++        vec3 pix = (lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL;
++        frag_color = vec4(pix, 1.0);
++}
+diff --git a/shaders/sgsr.f.glsl b/shaders/sgsr.f.glsl
+new file mode 100644
+index 0000000..30ed14e
+--- /dev/null
++++ b/shaders/sgsr.f.glsl
+@@ -0,0 +1,140 @@
++/* Snapdragon(TM) Game Super Resolution 1.0 (SGSR) -- single pass upscaler
++ *
++ * Port of sgsr1_shader_mobile.frag from
++ * https://github.com/SnapdragonGameStudios/snapdragon-gsr
++ *
++ *   Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
++ *   SPDX-License-Identifier: BSD-3-Clause
++ *   See licenses/SnapdragonGSR.txt.
++ *
++ * Changes from the original:
++ *  - Operation mode 1 (RGBA, green channel as the edge signal) is hard-wired,
++ *    since the game surface has no luma channel.
++ *  - textureGather() is not available in GLSL ES 3.00; it is emulated with
++ *    texelFetch() (clamped to the texture edge), and the base colour is a
++ *    manual bilinear fetch, so the result does not depend on the sampler's
++ *    filter / wrap state.
++ *  - Edge threshold and edge sharpness are uniforms (quality modes).
++ */
++
++uniform highp sampler2D tex;
++uniform vec2 u_src_size;          // size of the input texture in texels
++uniform vec2 u_out_size;          // size of the render target in pixels
++uniform float u_edge_sharpness;   // [1.0, 2.0], reference default 2.0
++uniform float u_edge_threshold;   // reference default 8.0/255.0
++
++in vec2 tex_coord;
++out vec4 frag_color;
++
++const int MODE = 1;               // channel used as the edge signal (G)
++
++vec4 fetch4(ivec2 p)
++{
++        ivec2 hi = ivec2(u_src_size) - ivec2(1);
++        return texelFetch(tex, clamp(p, ivec2(0), hi), 0);
++}
++
++// Emulation of textureGather(tex, coord, MODE):
++//   x = (i0, j0+1), y = (i0+1, j0+1), z = (i0+1, j0), w = (i0, j0)
++vec4 gather_c(vec2 coord)
++{
++        ivec2 b = ivec2(floor(coord * u_src_size - 0.5));
++        return vec4(fetch4(b + ivec2(0, 1))[MODE],
++                    fetch4(b + ivec2(1, 1))[MODE],
++                    fetch4(b + ivec2(1, 0))[MODE],
++                    fetch4(b)[MODE]);
++}
++
++vec3 sample_bilinear(vec2 uv)
++{
++        vec2 t = uv * u_src_size - 0.5;
++        ivec2 i0 = ivec2(floor(t));
++        vec2 fr = t - vec2(i0);
++        vec3 a = fetch4(i0).rgb;
++        vec3 b = fetch4(i0 + ivec2(1, 0)).rgb;
++        vec3 c = fetch4(i0 + ivec2(0, 1)).rgb;
++        vec3 d = fetch4(i0 + ivec2(1, 1)).rgb;
++        return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
++}
++
++float fastLanczos2(float x)
++{
++        float wA = x - 4.0;
++        float wB = x * wA - wA;
++        wA *= wA;
++        return wB * wA;
++}
++
++vec2 weightY(float dx, float dy, float c, float std)
++{
++        float x = ((dx * dx) + (dy * dy)) * 0.55 + clamp(abs(c) * std, 0.0, 1.0);
++        float w = fastLanczos2(x);
++        return vec2(w, w * c);
++}
++
++void main()
++{
++        vec2 vp_inv = 1.0 / u_src_size;     // ViewportInfo.xy
++        vec2 uv = tex_coord;
++
++        vec4 color;
++        color.xyz = sample_bilinear(uv);
++
++        vec2 imgCoord = (uv * u_src_size) + vec2(-0.5, 0.5);
++        vec2 imgCoordPixel = floor(imgCoord);
++        vec2 coord = imgCoordPixel * vp_inv;
++        vec2 pl = imgCoord + (-imgCoordPixel);
++        vec4 left = gather_c(coord);
++
++        float edgeVote = abs(left.z - left.y) + abs(color[MODE] - left.y)
++                       + abs(color[MODE] - left.z);
++        if (edgeVote > u_edge_threshold) {
++                coord.x += vp_inv.x;
++
++                vec4 right = gather_c(coord + vec2(vp_inv.x, 0.0));
++                vec4 upDown;
++                upDown.xy = gather_c(coord + vec2(0.0, -vp_inv.y)).wz;
++                upDown.zw = gather_c(coord + vec2(0.0,  vp_inv.y)).yx;
++
++                float mean = (left.y + left.z + right.x + right.w) * 0.25;
++                left = left - vec4(mean);
++                right = right - vec4(mean);
++                upDown = upDown - vec4(mean);
++                color.w = color[MODE] - mean;
++
++                float sum = (((((abs(left.x) + abs(left.y)) + abs(left.z)) + abs(left.w))
++                            + (((abs(right.x) + abs(right.y)) + abs(right.z)) + abs(right.w)))
++                            + (((abs(upDown.x) + abs(upDown.y)) + abs(upDown.z)) + abs(upDown.w)));
++                float std = 2.181818 / max(sum, 1.0e-6);
++
++                vec2 aWY = weightY(pl.x,       pl.y + 1.0, upDown.x, std);
++                aWY += weightY(pl.x - 1.0, pl.y + 1.0, upDown.y, std);
++                aWY += weightY(pl.x - 1.0, pl.y - 2.0, upDown.z, std);
++                aWY += weightY(pl.x,       pl.y - 2.0, upDown.w, std);
++                aWY += weightY(pl.x + 1.0, pl.y - 1.0, left.x,   std);
++                aWY += weightY(pl.x,       pl.y - 1.0, left.y,   std);
++                aWY += weightY(pl.x,       pl.y,       left.z,   std);
++                aWY += weightY(pl.x + 1.0, pl.y,       left.w,   std);
++                aWY += weightY(pl.x - 1.0, pl.y - 1.0, right.x,  std);
++                aWY += weightY(pl.x - 2.0, pl.y - 1.0, right.y,  std);
++                aWY += weightY(pl.x - 2.0, pl.y,       right.z,  std);
++                aWY += weightY(pl.x - 1.0, pl.y,       right.w,  std);
++
++                float finalY = aWY.y / aWY.x;
++
++                float maxY = max(max(left.y, left.z), max(right.x, right.w));
++                float minY = min(min(left.y, left.z), min(right.x, right.w));
++                finalY = clamp(u_edge_sharpness * finalY, minY, maxY);
++
++                float deltaY = finalY - color.w;
++
++                // smooth high contrast input
++                deltaY = clamp(deltaY, -23.0 / 255.0, 23.0 / 255.0);
++
++                color.x = clamp(color.x + deltaY, 0.0, 1.0);
++                color.y = clamp(color.y + deltaY, 0.0, 1.0);
++                color.z = clamp(color.z + deltaY, 0.0, 1.0);
++        }
++
++        frag_color = vec4(color.xyz, 1.0);
++}
+diff --git a/shaders/upscale.v.glsl b/shaders/upscale.v.glsl
+new file mode 100644
+index 0000000..9504b5b
+--- /dev/null
++++ b/shaders/upscale.v.glsl
+@@ -0,0 +1,14 @@
++/* Full-screen quad vertex shader for the FSR / SGSR upscaling passes.
++ *
++ * The unit quad [0,1]x[0,1] is mapped to the whole render target without any
++ * flipping, so the output texture keeps the same orientation as its input.
++ */
++
++in vec4 vertex_pos;
++in vec2 vertex_uv;
++out vec2 tex_coord;
++
++void main() {
++        gl_Position = vec4(vertex_pos.xy * 2.0 - 1.0, 0.0, 1.0);
++        tex_coord = vertex_uv;
++}
+diff --git a/src/android_jni.c b/src/android_jni.c
+new file mode 100644
+index 0000000..9b1e804
+--- /dev/null
++++ b/src/android_jni.c
+@@ -0,0 +1,197 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++/*
++ * JNI bridge between the Android UI (io.github.kichikuou.xsystem4.NativeBridge)
++ * and the engine's upscaler and cheat engine. These functions are called on
++ * the Android UI thread, not on the game thread.
++ */
++
++#if defined(__ANDROID__) || defined(XSYS4_JNI)
++
++#include <jni.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "cheat.h"
++#include "upscale.h"
++
++#define JNI_FN(name) Java_io_github_kichikuou_xsystem4_NativeBridge_##name
++#define RESULT_BUFFER_SIZE (256 * 1024)
++
++/*
++ * NewStringUTF() expects "modified UTF-8", which differs from UTF-8 for
++ * characters outside the BMP. Names in game data never need those, so
++ * replace anything outside well-formed 1-3 byte sequences.
++ */
++static void sanitize_utf8(char *s)
++{
++	unsigned char *p = (unsigned char *)s;
++	while (*p) {
++		int n = 0;
++		if (*p < 0x80)
++			n = 1;
++		else if ((*p & 0xe0) == 0xc0 && *p >= 0xc2)
++			n = 2;
++		else if ((*p & 0xf0) == 0xe0)
++			n = 3;
++		int ok = n > 0;
++		for (int i = 1; ok && i < n; i++)
++			ok = (p[i] & 0xc0) == 0x80;
++		if (ok && n == 3) {
++			unsigned cp = ((p[0] & 0x0f) << 12) | ((p[1] & 0x3f) << 6) | (p[2] & 0x3f);
++			ok = cp >= 0x800 && !(cp >= 0xd800 && cp <= 0xdfff);
++		}
++		if (ok) {
++			p += n;
++		} else {
++			*p++ = '?';
++			// swallow continuation bytes of the broken sequence
++			while ((*p & 0xc0) == 0x80)
++				*p++ = '?';
++		}
++	}
++}
++
++static jstring make_jstring(JNIEnv *env, char *utf8)
++{
++	sanitize_utf8(utf8);
++	return (*env)->NewStringUTF(env, utf8);
++}
++
++static char *copy_jstring(JNIEnv *env, jstring js)
++{
++	if (!js)
++		return strdup("");
++	const char *s = (*env)->GetStringUTFChars(env, js, NULL);
++	if (!s)
++		return strdup("");
++	char *copy = strdup(s);
++	(*env)->ReleaseStringUTFChars(env, js, s);
++	return copy ? copy : strdup("");
++}
++
++// Returns the listing, or "!<code>" if the cheat engine reported an error.
++static jstring listing_result(JNIEnv *env, char *buf, int rc)
++{
++	if (rc < 0) {
++		char err[16];
++		snprintf(err, sizeof(err), "!%d", rc);
++		free(buf);
++		return (*env)->NewStringUTF(env, err);
++	}
++	jstring js = make_jstring(env, buf);
++	free(buf);
++	return js;
++}
++
++JNIEXPORT void JNICALL JNI_FN(setUpscale)(JNIEnv *env, jclass cls, jint mode, jint quality)
++{
++	upscale_set(mode, quality);
++}
++
++JNIEXPORT jstring JNICALL JNI_FN(upscaleStatus)(JNIEnv *env, jclass cls)
++{
++	char buf[256];
++	upscale_status(buf, sizeof(buf));
++	return make_jstring(env, buf);
++}
++
++JNIEXPORT jint JNICALL JNI_FN(cheatReady)(JNIEnv *env, jclass cls)
++{
++	return cheat_is_ready() ? CHEAT_OK : CHEAT_NOT_READY;
++}
++
++JNIEXPORT jint JNICALL JNI_FN(cheatScanFirst)(JNIEnv *env, jclass cls, jint type, jint cmp,
++					      jstring value, jint flags)
++{
++	char *v = copy_jstring(env, value);
++	int rc = cheat_scan_first(type, cmp, v, flags);
++	free(v);
++	return rc;
++}
++
++JNIEXPORT jint JNICALL JNI_FN(cheatScanNext)(JNIEnv *env, jclass cls, jint cmp, jstring value)
++{
++	char *v = copy_jstring(env, value);
++	int rc = cheat_scan_next(cmp, v);
++	free(v);
++	return rc;
++}
++
++JNIEXPORT void JNICALL JNI_FN(cheatScanReset)(JNIEnv *env, jclass cls)
++{
++	cheat_scan_reset();
++}
++
++JNIEXPORT jboolean JNICALL JNI_FN(cheatScanTruncated)(JNIEnv *env, jclass cls)
++{
++	return cheat_scan_truncated();
++}
++
++JNIEXPORT jstring JNICALL JNI_FN(cheatScanResults)(JNIEnv *env, jclass cls, jint offset, jint limit)
++{
++	char *buf = malloc(RESULT_BUFFER_SIZE);
++	if (!buf)
++		return (*env)->NewStringUTF(env, "");
++	int rc = cheat_scan_results(offset, limit, buf, RESULT_BUFFER_SIZE);
++	return listing_result(env, buf, rc);
++}
++
++JNIEXPORT jstring JNICALL JNI_FN(cheatBrowse)(JNIEnv *env, jclass cls, jstring filter, jint limit)
++{
++	char *buf = malloc(RESULT_BUFFER_SIZE);
++	if (!buf)
++		return (*env)->NewStringUTF(env, "");
++	char *f = copy_jstring(env, filter);
++	int rc = cheat_browse(f, limit, buf, RESULT_BUFFER_SIZE);
++	free(f);
++	return listing_result(env, buf, rc);
++}
++
++JNIEXPORT jstring JNICALL JNI_FN(cheatFrozen)(JNIEnv *env, jclass cls)
++{
++	char *buf = malloc(RESULT_BUFFER_SIZE);
++	if (!buf)
++		return (*env)->NewStringUTF(env, "");
++	int rc = cheat_frozen_list(buf, RESULT_BUFFER_SIZE);
++	return listing_result(env, buf, rc);
++}
++
++JNIEXPORT jint JNICALL JNI_FN(cheatWrite)(JNIEnv *env, jclass cls, jint slot, jint index,
++					  jlong seq, jint kind, jstring value)
++{
++	char *v = copy_jstring(env, value);
++	int rc = cheat_write(slot, index, (uint32_t)seq, kind, v);
++	free(v);
++	return rc;
++}
++
++JNIEXPORT jint JNICALL JNI_FN(cheatFreeze)(JNIEnv *env, jclass cls, jint slot, jint index,
++					   jlong seq, jint kind, jstring value, jstring label,
++					   jboolean enable)
++{
++	char *v = copy_jstring(env, value);
++	char *l = copy_jstring(env, label);
++	int rc = cheat_freeze(slot, index, (uint32_t)seq, kind, v, l, enable);
++	free(v);
++	free(l);
++	return rc;
++}
++
++#endif /* __ANDROID__ || XSYS4_JNI */
+diff --git a/src/cheat.c b/src/cheat.c
+new file mode 100644
+index 0000000..6a719ac
+--- /dev/null
++++ b/src/cheat.c
+@@ -0,0 +1,1019 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#include <ctype.h>
++#include <errno.h>
++#include <limits.h>
++#include <math.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "system4/ain.h"
++#include "system4/utfsjis.h"
++#include "cheat.h"
++#include "vm.h"
++#include "vm/heap.h"
++#include "vm/page.h"
++
++/*
++ * Variables are addressed by (heap slot, index in page, slot sequence number).
++ * The sequence number changes whenever a heap slot is reused, so an address
++ * left over from before a page was freed is detected as stale instead of
++ * silently pointing at an unrelated object.
++ */
++
++#define MAX_CANDIDATES 3000000
++#define MAX_FROZEN 128
++#define LOCK_TIMEOUT_SEC 2
++
++/* ------------------------------------------------------------------------ */
++/* Hand-over of the VM between the game thread and the UI thread            */
++/* ------------------------------------------------------------------------ */
++
++static pthread_mutex_t vm_lock = PTHREAD_MUTEX_INITIALIZER;
++static atomic_int ui_waiting;
++static atomic_bool ready;
++static bool inited;  // game thread only
++
++static void apply_frozen(void);
++
++void cheat_init(void)
++{
++	if (inited)
++		return;
++	inited = true;
++	// The game thread owns the VM except while it sits at a safe point.
++	pthread_mutex_lock(&vm_lock);
++	atomic_store(&ready, true);
++}
++
++void cheat_safepoint_begin(void)
++{
++	if (!inited)
++		return;
++	apply_frozen();
++	pthread_mutex_unlock(&vm_lock);
++	// Give a waiting UI request a chance to take the lock before the game
++	// thread re-acquires it (mutexes are not fair).
++	for (int i = 0; i < 40 && atomic_load(&ui_waiting) > 0; i++)
++		usleep(500);
++}
++
++void cheat_safepoint_end(void)
++{
++	if (inited)
++		pthread_mutex_lock(&vm_lock);
++}
++
++bool cheat_is_ready(void)
++{
++	return atomic_load(&ready);
++}
++
++static int ui_lock(void)
++{
++	if (!atomic_load(&ready))
++		return CHEAT_NOT_READY;
++	atomic_fetch_add(&ui_waiting, 1);
++	struct timespec ts;
++	clock_gettime(CLOCK_REALTIME, &ts);
++	ts.tv_sec += LOCK_TIMEOUT_SEC;
++	int r = pthread_mutex_timedlock(&vm_lock, &ts);
++	atomic_fetch_sub(&ui_waiting, 1);
++	return r == 0 ? CHEAT_OK : CHEAT_BUSY;
++}
++
++static void ui_unlock(void)
++{
++	pthread_mutex_unlock(&vm_lock);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Variables                                                                 */
++/* ------------------------------------------------------------------------ */
++
++static bool is_container_type(enum ain_data_type t)
++{
++	switch (t) {
++	case AIN_STRUCT:
++	case AIN_ARRAY_INT:
++	case AIN_ARRAY_FLOAT:
++	case AIN_ARRAY_STRING:
++	case AIN_ARRAY_STRUCT:
++	case AIN_ARRAY_BOOL:
++	case AIN_ARRAY_LONG_INT:
++	case AIN_ARRAY_FUNC_TYPE:
++	case AIN_ARRAY_DELEGATE:
++	case AIN_ARRAY:
++		return true;
++	default:
++		return false;
++	}
++}
++
++// variable_type() with bounds checks, so that a stale or odd page can't make
++// the cheat engine read outside of the AIN tables.
++static enum ain_data_type safe_var_type(struct page *p, int i)
++{
++	if (i < 0 || i >= p->nr_vars)
++		return AIN_VOID;
++	switch (p->type) {
++	case GLOBAL_PAGE:
++		if (i >= ain->nr_globals)
++			return AIN_VOID;
++		break;
++	case LOCAL_PAGE:
++		if (p->index < 0 || p->index >= ain->nr_functions || i >= ain->functions[p->index].nr_vars)
++			return AIN_VOID;
++		break;
++	case STRUCT_PAGE:
++		if (p->index < 0 || p->index >= ain->nr_structures || i >= ain->structures[p->index].nr_members)
++			return AIN_VOID;
++		break;
++	case ARRAY_PAGE:
++		break;
++	default:
++		return AIN_VOID;
++	}
++	return variable_type(p, i, NULL, NULL);
++}
++
++static int scalar_kind(struct page *p, int i)
++{
++	switch (safe_var_type(p, i)) {
++	case AIN_INT:
++	case AIN_LONG_INT:
++		return CHEAT_INT;
++	case AIN_BOOL:
++		return CHEAT_BOOL;
++	case AIN_FLOAT:
++		return CHEAT_FLOAT;
++	default:
++		return -1;
++	}
++}
++
++static const char *raw_var_name(struct page *p, int i)
++{
++	switch (p->type) {
++	case GLOBAL_PAGE:
++		return i >= 0 && i < ain->nr_globals ? ain->globals[i].name : NULL;
++	case LOCAL_PAGE:
++		if (p->index >= 0 && p->index < ain->nr_functions && i >= 0 && i < ain->functions[p->index].nr_vars)
++			return ain->functions[p->index].vars[i].name;
++		return NULL;
++	case STRUCT_PAGE:
++		if (p->index >= 0 && p->index < ain->nr_structures && i >= 0 && i < ain->structures[p->index].nr_members)
++			return ain->structures[p->index].members[i].name;
++		return NULL;
++	default:
++		return NULL;
++	}
++}
++
++static struct page *resolve(int32_t slot, int32_t index, uint32_t seq)
++{
++	if (slot < 0 || !page_index_valid(slot))
++		return NULL;
++	if (heap[slot].seq != seq)
++		return NULL;
++	struct page *p = heap[slot].page;
++	if (!p || p->type == DELEGATE_PAGE || index < 0 || index >= p->nr_vars)
++		return NULL;
++	return p;
++}
++
++/* Replace anything that would break the tab/newline separated protocol. */
++static void clean_text(char *s)
++{
++	for (; *s; s++) {
++		if (*s == '\t' || *s == '\n' || *s == '\r')
++			*s = ' ';
++	}
++}
++
++static char *name_utf8(const char *raw)
++{
++	if (!raw || !*raw)
++		return strdup("?");
++	char *s = sjis2utf(raw, 0);
++	if (!s)
++		return strdup("?");
++	clean_text(s);
++	return s;
++}
++
++static void format_value(char *out, size_t size, int kind, union vm_value v)
++{
++	if (kind == CHEAT_FLOAT)
++		snprintf(out, size, "%.7g", (double)v.f);
++	else
++		snprintf(out, size, "%d", v.i);
++}
++
++static bool parse_int(const char *s, int32_t *out)
++{
++	if (!s)
++		return false;
++	while (isspace((unsigned char)*s))
++		s++;
++	if (!*s)
++		return false;
++	const char *digits = s + (*s == '-' || *s == '+');
++	int base = (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) ? 16 : 10;
++	char *end;
++	errno = 0;
++	long long v = strtoll(s, &end, base);
++	if (end == s || errno)
++		return false;
++	while (isspace((unsigned char)*end))
++		end++;
++	if (*end)
++		return false;
++	if (v < INT32_MIN || v > (long long)UINT32_MAX)
++		return false;
++	*out = (int32_t)(uint32_t)(int64_t)v;
++	return true;
++}
++
++static bool parse_float(const char *s, float *out)
++{
++	if (!s)
++		return false;
++	while (isspace((unsigned char)*s))
++		s++;
++	if (!*s)
++		return false;
++	char *end;
++	errno = 0;
++	float v = strtof(s, &end);
++	if (end == s)
++		return false;
++	while (isspace((unsigned char)*end))
++		end++;
++	if (*end || !isfinite(v))
++		return false;
++	*out = v;
++	return true;
++}
++
++static bool parse_value(int kind, const char *s, union vm_value *out)
++{
++	switch (kind) {
++	case CHEAT_FLOAT: {
++		float f;
++		if (!parse_float(s, &f))
++			return false;
++		*out = vm_float(f);
++		return true;
++	}
++	case CHEAT_BOOL: {
++		int32_t i;
++		if (!parse_int(s, &i))
++			return false;
++		*out = vm_int(i != 0);
++		return true;
++	}
++	default: {
++		int32_t i;
++		if (!parse_int(s, &i))
++			return false;
++		*out = vm_int(i);
++		return true;
++	}
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* Frozen values                                                             */
++/* ------------------------------------------------------------------------ */
++
++struct frozen {
++	int32_t slot;
++	int32_t index;
++	uint32_t seq;
++	int kind;
++	union vm_value value;
++	char label[96];
++};
++
++static struct frozen frozen[MAX_FROZEN];
++static int nr_frozen;
++
++static struct frozen *find_frozen(int32_t slot, int32_t index, uint32_t seq)
++{
++	for (int i = 0; i < nr_frozen; i++) {
++		if (frozen[i].slot == slot && frozen[i].index == index && frozen[i].seq == seq)
++			return &frozen[i];
++	}
++	return NULL;
++}
++
++// Called by the game thread (VM lock held) at every safe point.
++static void apply_frozen(void)
++{
++	for (int i = 0; i < nr_frozen; ) {
++		struct frozen *f = &frozen[i];
++		struct page *p = resolve(f->slot, f->index, f->seq);
++		if (!p || scalar_kind(p, f->index) < 0) {
++			// The variable is gone (e.g. a different save was loaded).
++			frozen[i] = frozen[--nr_frozen];
++			continue;
++		}
++		if (p->values[f->index].i != f->value.i)
++			p->values[f->index] = f->value;
++		i++;
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* Walking the variable tree (globals -> structs -> arrays)                 */
++/* ------------------------------------------------------------------------ */
++
++#define WALK_MAX_DEPTH 8
++#define WALK_MAX_PAGES 400000
++
++struct path_elem {
++	const char *raw_name;  // SJIS/GBK name from the AIN, or NULL
++	int index;             // array index when raw_name is NULL
++};
++
++struct walker {
++	uint8_t *visited;
++	int pages_left;
++	int depth;
++	struct path_elem stack[WALK_MAX_DEPTH + 1];
++	void *ctx;
++	bool (*on_page)(struct walker *, struct page *, int slot);  // false: stop
++};
++
++static void append(char *out, size_t size, const char *s)
++{
++	size_t len = strlen(out);
++	if (len + 1 < size)
++		snprintf(out + len, size - len, "%s", s);
++}
++
++// Append one path element ("name" / ".name" / "[i]") to OUT.
++static void append_elem(char *out, size_t size, const char *raw_name, int index)
++{
++	if (raw_name) {
++		char *n = name_utf8(raw_name);
++		if (out[0])
++			append(out, size, ".");
++		append(out, size, n);
++		free(n);
++	} else {
++		char tmp[24];
++		snprintf(tmp, sizeof(tmp), "[%d]", index);
++		append(out, size, tmp);
++	}
++}
++
++static void path_format(const struct walker *w, char *out, size_t size)
++{
++	out[0] = '\0';
++	for (int i = 0; i < w->depth; i++)
++		append_elem(out, size, w->stack[i].raw_name, w->stack[i].index);
++}
++
++static bool walk_page(struct walker *w, int slot)
++{
++	if (w->pages_left <= 0)
++		return false;
++	if (slot < 0 || (size_t)slot >= heap_size || w->visited[slot >> 3] & (1u << (slot & 7)))
++		return true;
++	if (!page_index_valid(slot))
++		return true;
++	w->visited[slot >> 3] |= 1u << (slot & 7);
++	w->pages_left--;
++
++	struct page *p = heap[slot].page;
++	if (p->type == DELEGATE_PAGE || p->type == LOCAL_PAGE)
++		return true;
++	if (!w->on_page(w, p, slot))
++		return false;
++	if (w->depth >= WALK_MAX_DEPTH || p->nr_vars <= 0)
++		return true;
++
++	bool is_array = p->type == ARRAY_PAGE;
++	enum ain_data_type elem_type = is_array ? safe_var_type(p, 0) : AIN_VOID;
++	if (is_array && !is_container_type(elem_type))
++		return true;  // array of scalars/strings: no children
++
++	for (int i = 0; i < p->nr_vars; i++) {
++		if (!is_array && !is_container_type(safe_var_type(p, i)))
++			continue;
++		int child = p->values[i].i;
++		if (child <= 0)
++			continue;
++		w->stack[w->depth++] = (struct path_elem) {
++			.raw_name = is_array ? NULL : raw_var_name(p, i),
++			.index = i,
++		};
++		bool cont = walk_page(w, child);
++		w->depth--;
++		if (!cont)
++			return false;
++	}
++	return true;
++}
++
++static void walk_globals(void *ctx, bool (*on_page)(struct walker *, struct page *, int))
++{
++	struct walker w = {
++		.visited = calloc(heap_size / 8 + 1, 1),
++		.pages_left = WALK_MAX_PAGES,
++		.ctx = ctx,
++		.on_page = on_page,
++	};
++	if (!w.visited)
++		return;
++	if (heap_size > 0 && heap[0].ref > 0)
++		walk_page(&w, 0);
++	free(w.visited);
++}
++
++// Label of element I of page P, given the path BASE of the page itself.
++static void element_label(struct page *p, int slot, int i, const char *base, char *out, size_t size)
++{
++	snprintf(out, size, "%s", base);
++	switch (p->type) {
++	case ARRAY_PAGE:
++		append_elem(out, size, NULL, i);
++		break;
++	case GLOBAL_PAGE:
++	case STRUCT_PAGE:
++		append_elem(out, size, raw_var_name(p, i), i);
++		break;
++	default:
++		break;
++	}
++	(void)slot;
++}
++
++// Fallback label for pages that can't be reached from the globals.
++static void fallback_label(struct page *p, int slot, int i, char *out, size_t size)
++{
++	char tmp[160];
++	const char *raw = raw_var_name(p, i);
++	char *n = raw ? name_utf8(raw) : NULL;
++	switch (p->type) {
++	case STRUCT_PAGE: {
++		const char *sname = (p->index >= 0 && p->index < ain->nr_structures) ? ain->structures[p->index].name : NULL;
++		char *s = name_utf8(sname);
++		snprintf(tmp, sizeof(tmp), "%s.%s @%d", s, n ? n : "?", slot);
++		free(s);
++		break;
++	}
++	case LOCAL_PAGE: {
++		const char *fname = (p->index >= 0 && p->index < ain->nr_functions) ? ain->functions[p->index].name : NULL;
++		char *f = name_utf8(fname);
++		snprintf(tmp, sizeof(tmp), "%s() / %s", f, n ? n : "?");
++		free(f);
++		break;
++	}
++	case ARRAY_PAGE:
++		snprintf(tmp, sizeof(tmp), "array @%d [%d]", slot, i);
++		break;
++	default:
++		snprintf(tmp, sizeof(tmp), "%s", n ? n : "?");
++		break;
++	}
++	free(n);
++	snprintf(out, size, "%s", tmp);
++}
++
++/* ------------------------------------------------------------------------ */
++/* Output buffer helper                                                      */
++/* ------------------------------------------------------------------------ */
++
++struct outbuf {
++	char *buf;
++	size_t size;
++	size_t len;
++	bool full;
++};
++
++static void out_line(struct outbuf *o, int32_t slot, int32_t index, uint32_t seq, int kind,
++		     bool is_frozen, union vm_value v, const char *label)
++{
++	if (o->full)
++		return;
++	char val[40];
++	format_value(val, sizeof(val), kind, v);
++	char lab[200];
++	snprintf(lab, sizeof(lab), "%s", label);
++	clean_text(lab);
++	int n = snprintf(o->buf + o->len, o->size - o->len, "%d\t%d\t%u\t%d\t%d\t%s\t%s\n",
++			 slot, index, seq, kind, is_frozen ? 1 : 0, val, lab);
++	if (n < 0 || (size_t)n >= o->size - o->len) {
++		o->full = true;
++		o->buf[o->len] = '\0';
++		return;
++	}
++	o->len += n;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Variable browser                                                          */
++/* ------------------------------------------------------------------------ */
++
++static bool contains_icase(const char *hay, const char *needle)
++{
++	if (!*needle)
++		return true;
++	size_t nl = strlen(needle);
++	for (; *hay; hay++) {
++		size_t i = 0;
++		while (i < nl && hay[i] &&
++		       tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i]))
++			i++;
++		if (i == nl)
++			return true;
++	}
++	return false;
++}
++
++struct browse_ctx {
++	const char *filter;
++	int limit;
++	int emitted;
++	struct outbuf *out;
++};
++
++static bool browse_on_page(struct walker *w, struct page *p, int slot)
++{
++	struct browse_ctx *c = w->ctx;
++	char base[512];
++	bool have_base = false;
++	int seen = 0;
++
++	for (int i = 0; i < p->nr_vars; i++) {
++		int kind = scalar_kind(p, i);
++		if (kind < 0)
++			continue;
++		if (p->type == ARRAY_PAGE && seen++ >= 128)
++			break;  // only the first elements of big arrays are listed
++		if (!have_base) {
++			path_format(w, base, sizeof(base));
++			have_base = true;
++		}
++		char label[640];
++		element_label(p, slot, i, base, label, sizeof(label));
++		if (c->filter[0] && !contains_icase(label, c->filter))
++			continue;
++		out_line(c->out, slot, i, heap[slot].seq, kind,
++			 find_frozen(slot, i, heap[slot].seq) != NULL, p->values[i], label);
++		if (c->out->full || ++c->emitted >= c->limit)
++			return false;
++	}
++	return true;
++}
++
++int cheat_browse(const char *filter, int limit, char *buf, size_t size)
++{
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	struct outbuf out = { .buf = buf, .size = size };
++	buf[0] = '\0';
++	struct browse_ctx ctx = { .filter = filter ? filter : "", .limit = limit > 0 ? limit : 200, .out = &out };
++	walk_globals(&ctx, browse_on_page);
++	ui_unlock();
++	return (int)out.len;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Scanner                                                                   */
++/* ------------------------------------------------------------------------ */
++
++struct candidate {
++	int32_t slot;
++	int32_t index;
++	uint32_t seq;
++	union vm_value prev;
++};
++
++static struct candidate *cands;
++static size_t nr_cands;
++static size_t cap_cands;
++static int scan_type = -1;  // -1: no scan in progress
++static atomic_bool scan_truncated;
++
++static void free_scan(void)
++{
++	free(cands);
++	cands = NULL;
++	nr_cands = cap_cands = 0;
++	scan_type = -1;
++	atomic_store(&scan_truncated, false);
++}
++
++static bool add_candidate(int32_t slot, int32_t index, uint32_t seq, union vm_value v)
++{
++	if (nr_cands >= MAX_CANDIDATES) {
++		atomic_store(&scan_truncated, true);
++		return false;
++	}
++	if (nr_cands == cap_cands) {
++		size_t ncap = cap_cands ? cap_cands * 2 : 4096;
++		struct candidate *n = realloc(cands, ncap * sizeof(*n));
++		if (!n) {
++			atomic_store(&scan_truncated, true);
++			return false;
++		}
++		cands = n;
++		cap_cands = ncap;
++	}
++	cands[nr_cands++] = (struct candidate) { slot, index, seq, v };
++	return true;
++}
++
++static bool float_eq(float a, float b)
++{
++	return fabsf(a - b) <= 1e-4f * fmaxf(1.0f, fabsf(b));
++}
++
++static bool match_value(int type, int cmp, union vm_value cur, union vm_value prev, union vm_value arg)
++{
++	if (type == CHEAT_SCAN_FLOAT) {
++		if (!isfinite(cur.f))
++			return false;
++		switch (cmp) {
++		case CHEAT_CMP_EXACT:     return float_eq(cur.f, arg.f);
++		case CHEAT_CMP_UNKNOWN:   return true;
++		case CHEAT_CMP_GREATER:   return cur.f > arg.f;
++		case CHEAT_CMP_LESS:      return cur.f < arg.f;
++		case CHEAT_CMP_CHANGED:   return cur.i != prev.i;
++		case CHEAT_CMP_UNCHANGED: return cur.i == prev.i;
++		case CHEAT_CMP_INCREASED: return cur.f > prev.f;
++		case CHEAT_CMP_DECREASED: return cur.f < prev.f;
++		}
++	} else {
++		switch (cmp) {
++		case CHEAT_CMP_EXACT:     return cur.i == arg.i;
++		case CHEAT_CMP_UNKNOWN:   return true;
++		case CHEAT_CMP_GREATER:   return cur.i > arg.i;
++		case CHEAT_CMP_LESS:      return cur.i < arg.i;
++		case CHEAT_CMP_CHANGED:   return cur.i != prev.i;
++		case CHEAT_CMP_UNCHANGED: return cur.i == prev.i;
++		case CHEAT_CMP_INCREASED: return cur.i > prev.i;
++		case CHEAT_CMP_DECREASED: return cur.i < prev.i;
++		}
++	}
++	return false;
++}
++
++static bool cmp_needs_value(int cmp)
++{
++	return cmp == CHEAT_CMP_EXACT || cmp == CHEAT_CMP_GREATER || cmp == CHEAT_CMP_LESS;
++}
++
++static bool kind_matches_type(int kind, int type)
++{
++	if (type == CHEAT_SCAN_FLOAT)
++		return kind == CHEAT_FLOAT;
++	return kind == CHEAT_INT || kind == CHEAT_BOOL;
++}
++
++int cheat_scan_first(int type, int cmp, const char *value, int flags)
++{
++	if (type != CHEAT_SCAN_INT && type != CHEAT_SCAN_FLOAT)
++		return CHEAT_BAD_TYPE;
++	if (cmp != CHEAT_CMP_EXACT && cmp != CHEAT_CMP_UNKNOWN &&
++	    cmp != CHEAT_CMP_GREATER && cmp != CHEAT_CMP_LESS)
++		return CHEAT_BAD_TYPE;
++
++	union vm_value arg = { .i = 0 };
++	if (cmp_needs_value(cmp) && !parse_value(type == CHEAT_SCAN_FLOAT ? CHEAT_FLOAT : CHEAT_INT, value, &arg))
++		return CHEAT_BAD_VALUE;
++
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++
++	free_scan();
++	scan_type = type;
++	for (size_t s = 0; s < heap_size; s++) {
++		if (!page_index_valid(s))
++			continue;
++		struct page *p = heap[s].page;
++		if (p->type == DELEGATE_PAGE)
++			continue;
++		if (p->type == LOCAL_PAGE && !(flags & CHEAT_SCAN_INCLUDE_LOCALS))
++			continue;
++		uint32_t seq = heap[s].seq;
++
++		// Arrays have a single element type; avoid asking for each element.
++		int array_kind = -1;
++		if (p->type == ARRAY_PAGE) {
++			if (p->nr_vars <= 0)
++				continue;
++			array_kind = scalar_kind(p, 0);
++			if (array_kind < 0 || !kind_matches_type(array_kind, type))
++				continue;
++		}
++		for (int i = 0; i < p->nr_vars; i++) {
++			int kind = p->type == ARRAY_PAGE ? array_kind : scalar_kind(p, i);
++			if (kind < 0 || !kind_matches_type(kind, type))
++				continue;
++			union vm_value v = p->values[i];
++			if (!match_value(type, cmp, v, v, arg))
++				continue;
++			if (!add_candidate(s, i, seq, v))
++				goto done;
++		}
++	}
++done:;
++	int n = (int)nr_cands;
++	ui_unlock();
++	return n;
++}
++
++int cheat_scan_next(int cmp, const char *value)
++{
++	if (cmp < CHEAT_CMP_EXACT || cmp > CHEAT_CMP_DECREASED || cmp == CHEAT_CMP_UNKNOWN)
++		return CHEAT_BAD_TYPE;
++	union vm_value arg = { .i = 0 };
++	// scan_type is only written under the lock, but reading the type needed
++	// to parse the value requires it; parse after locking.
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	if (scan_type < 0) {
++		ui_unlock();
++		return CHEAT_NO_SCAN;
++	}
++	if (cmp_needs_value(cmp) &&
++	    !parse_value(scan_type == CHEAT_SCAN_FLOAT ? CHEAT_FLOAT : CHEAT_INT, value, &arg)) {
++		ui_unlock();
++		return CHEAT_BAD_VALUE;
++	}
++
++	size_t keep = 0;
++	for (size_t i = 0; i < nr_cands; i++) {
++		struct candidate *c = &cands[i];
++		struct page *p = resolve(c->slot, c->index, c->seq);
++		if (!p)
++			continue;
++		union vm_value cur = p->values[c->index];
++		if (!match_value(scan_type, cmp, cur, c->prev, arg))
++			continue;
++		cands[keep] = *c;
++		cands[keep].prev = cur;
++		keep++;
++	}
++	nr_cands = keep;
++	int n = (int)nr_cands;
++	ui_unlock();
++	return n;
++}
++
++void cheat_scan_reset(void)
++{
++	if (ui_lock() != CHEAT_OK)
++		return;
++	free_scan();
++	ui_unlock();
++}
++
++bool cheat_scan_truncated(void)
++{
++	return atomic_load(&scan_truncated);
++}
++
++struct label_ctx {
++	int32_t *wanted;  // sorted, unique heap slots
++	char **paths;     // path of each wanted slot (NULL: unreachable)
++	int nr_wanted;
++	int found;
++};
++
++static int cmp_i32(const void *a, const void *b)
++{
++	int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
++	return (x > y) - (x < y);
++}
++
++static bool label_on_page(struct walker *w, struct page *p, int slot)
++{
++	struct label_ctx *c = w->ctx;
++	int32_t key = slot;
++	int32_t *hit = bsearch(&key, c->wanted, c->nr_wanted, sizeof(int32_t), cmp_i32);
++	if (hit) {
++		int k = hit - c->wanted;
++		if (!c->paths[k]) {
++			char path[512];
++			path_format(w, path, sizeof(path));
++			c->paths[k] = strdup(path);
++			c->found++;
++		}
++	}
++	(void)p;
++	return c->found < c->nr_wanted;
++}
++
++int cheat_scan_results(int offset, int limit, char *buf, size_t size)
++{
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	buf[0] = '\0';
++	struct outbuf out = { .buf = buf, .size = size };
++	if (scan_type < 0) {
++		ui_unlock();
++		return CHEAT_NO_SCAN;
++	}
++	if (offset < 0)
++		offset = 0;
++	if (limit <= 0)
++		limit = 100;
++	size_t end = (size_t)offset + limit;
++	if (end > nr_cands)
++		end = nr_cands;
++
++	// Find readable names for the pages the shown results live in.
++	struct label_ctx lc = { 0 };
++	if ((size_t)offset < end) {
++		size_t n = end - offset;
++		lc.wanted = malloc(n * sizeof(int32_t));
++		lc.paths = calloc(n, sizeof(char *));
++		if (lc.wanted && lc.paths) {
++			for (size_t i = offset; i < end; i++)
++				lc.wanted[lc.nr_wanted++] = cands[i].slot;
++			qsort(lc.wanted, lc.nr_wanted, sizeof(int32_t), cmp_i32);
++			int u = 0;
++			for (int i = 0; i < lc.nr_wanted; i++) {
++				if (i == 0 || lc.wanted[i] != lc.wanted[i - 1])
++					lc.wanted[u++] = lc.wanted[i];
++			}
++			lc.nr_wanted = u;
++			walk_globals(&lc, label_on_page);
++		}
++	}
++
++	for (size_t i = offset; i < end; i++) {
++		struct candidate *c = &cands[i];
++		struct page *p = resolve(c->slot, c->index, c->seq);
++		if (!p)
++			continue;  // went away since the last scan
++		int kind = scalar_kind(p, c->index);
++		if (kind < 0)
++			continue;
++		char label[640];
++		int32_t key = c->slot;
++		int32_t *hit = lc.nr_wanted ? bsearch(&key, lc.wanted, lc.nr_wanted, sizeof(int32_t), cmp_i32) : NULL;
++		if (hit && lc.paths[hit - lc.wanted])
++			element_label(p, c->slot, c->index, lc.paths[hit - lc.wanted], label, sizeof(label));
++		else
++			fallback_label(p, c->slot, c->index, label, sizeof(label));
++		out_line(&out, c->slot, c->index, c->seq, kind,
++			 find_frozen(c->slot, c->index, c->seq) != NULL, p->values[c->index], label);
++	}
++
++	if (lc.paths) {
++		for (int i = 0; i < lc.nr_wanted; i++)
++			free(lc.paths[i]);
++	}
++	free(lc.paths);
++	free(lc.wanted);
++	ui_unlock();
++	return (int)out.len;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Editing                                                                   */
++/* ------------------------------------------------------------------------ */
++
++int cheat_write(int32_t slot, int32_t index, uint32_t seq, int kind_hint, const char *value)
++{
++	(void)kind_hint;
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	struct page *p = resolve(slot, index, seq);
++	if (!p) {
++		ui_unlock();
++		return CHEAT_STALE;
++	}
++	int kind = scalar_kind(p, index);
++	union vm_value v;
++	if (kind < 0) {
++		ui_unlock();
++		return CHEAT_BAD_TYPE;
++	}
++	if (!parse_value(kind, value, &v)) {
++		ui_unlock();
++		return CHEAT_BAD_VALUE;
++	}
++	p->values[index] = v;
++	// Keep a frozen entry in sync, otherwise the next safe point would undo
++	// the edit.
++	struct frozen *f = find_frozen(slot, index, seq);
++	if (f)
++		f->value = v;
++	ui_unlock();
++	return CHEAT_OK;
++}
++
++int cheat_freeze(int32_t slot, int32_t index, uint32_t seq, int kind_hint, const char *value,
++		 const char *label, bool enable)
++{
++	(void)kind_hint;
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	struct frozen *f = find_frozen(slot, index, seq);
++	if (!enable) {
++		if (f)
++			*f = frozen[--nr_frozen];
++		ui_unlock();
++		return CHEAT_OK;
++	}
++
++	struct page *p = resolve(slot, index, seq);
++	if (!p) {
++		ui_unlock();
++		return CHEAT_STALE;
++	}
++	int kind = scalar_kind(p, index);
++	if (kind < 0) {
++		ui_unlock();
++		return CHEAT_BAD_TYPE;
++	}
++	union vm_value v;
++	if (value && *value) {
++		if (!parse_value(kind, value, &v)) {
++			ui_unlock();
++			return CHEAT_BAD_VALUE;
++		}
++	} else {
++		v = p->values[index];  // freeze at the current value
++	}
++	if (!f) {
++		if (nr_frozen >= MAX_FROZEN) {
++			ui_unlock();
++			return CHEAT_FULL;
++		}
++		f = &frozen[nr_frozen++];
++		f->slot = slot;
++		f->index = index;
++		f->seq = seq;
++	}
++	f->kind = kind;
++	f->value = v;
++	snprintf(f->label, sizeof(f->label), "%s", label ? label : "");
++	clean_text(f->label);
++	p->values[index] = v;
++	ui_unlock();
++	return CHEAT_OK;
++}
++
++int cheat_frozen_list(char *buf, size_t size)
++{
++	int rc = ui_lock();
++	if (rc)
++		return rc;
++	buf[0] = '\0';
++	struct outbuf out = { .buf = buf, .size = size };
++	for (int i = 0; i < nr_frozen; i++) {
++		struct frozen *f = &frozen[i];
++		struct page *p = resolve(f->slot, f->index, f->seq);
++		if (!p)
++			continue;
++		out_line(&out, f->slot, f->index, f->seq, f->kind, true, p->values[f->index], f->label);
++	}
++	ui_unlock();
++	return (int)out.len;
++}
++
++/* ------------------------------------------------------------------------ */
++/* VM restart                                                                */
++/* ------------------------------------------------------------------------ */
++
++// Game thread, VM lock held.
++void cheat_vm_reset(void)
++{
++	free_scan();
++	nr_frozen = 0;
++}
+diff --git a/src/input.c b/src/input.c
+index 86bcf73..fe6db19 100644
+--- a/src/input.c
++++ b/src/input.c
+@@ -21,6 +21,7 @@
+ #include "queue.h"
+ #include "gfx/gfx.h"
+ #include "gfx/private.h"
++#include "cheat.h"
+ #include "input.h"
+ #include "scene.h"
+ #include "vm.h"
+@@ -636,6 +637,14 @@ void handle_events(void)
+ {
+ 	fire_deferred_events();
+ 
++	// SDL_PumpEvents() is where the Android activity lifecycle can block the
++	// game thread (e.g. while a dialog is open), so this is the point where
++	// the cheat engine may take over the VM. Events are dispatched below,
++	// after the VM has been taken back.
++	cheat_safepoint_begin();
++	SDL_PumpEvents();
++	cheat_safepoint_end();
++
+ 	SDL_Event e;
+ 	while (SDL_PollEvent(&e)) {
+ 		switch (e.type) {
+diff --git a/src/meson.build b/src/meson.build
+index 78414bb..92ed4a8 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -11,6 +11,7 @@ xsystem4 = [version_h,
+             'asset_manager.c',
+             'base64.c',
+             'cJSON.c',
++            'cheat.c',
+             'draw.c',
+             'effect.c',
+             'ffi.c',
+@@ -33,6 +34,7 @@ xsystem4 = [version_h,
+             'swf.c',
+             'system4.c',
+             'text.c',
++            'upscale.c',
+             'util.c',
+             'video.c',
+             'vm.c',
+diff --git a/src/system4.c b/src/system4.c
+index 1165fc7..af3bc0a 100644
+--- a/src/system4.c
++++ b/src/system4.c
+@@ -39,6 +39,7 @@
+ #include "debugger.h"
+ #include "gfx/gfx.h"
+ #include "gfx/font.h"
++#include "upscale.h"
+ #include "vm.h"
+ 
+ #include "version.h"
+@@ -393,6 +394,8 @@ static void usage(void)
+ 	puts("    -a, --audit          Audit AIN file for xsystem4 compatibility");
+ 	puts("    -e, --echo-message   Echo in-game messages to standard output");
+ 	puts("        --encoding       Specify the game's character encoding. sjis (default) or gbk");
++	puts("        --upscale        Upscaling filter for the game screen: off (default), fsr or sgsr");
++	puts("        --upscale-quality  Upscaler quality: ultra, quality (default), balanced or performance");
+ 	puts("        --font-mincho    Specify the path to the mincho font to use (path[:index] for .ttc)");
+ 	puts("        --font-gothic    Specify the path to the gothic font to use (path[:index] for .ttc)");
+ 	puts("        --font-fnl       Specify the path to a .fnl font library to use");
+@@ -433,6 +436,8 @@ enum {
+ 	LOPT_MSGSKIP_DELAY,
+ 	LOPT_SAVE_FOLDER,
+ 	LOPT_SAVE_FORMAT,
++	LOPT_UPSCALE,
++	LOPT_UPSCALE_QUALITY,
+ #ifdef DEBUGGER_ENABLED
+ 	LOPT_NODEBUG,
+ 	LOPT_DEBUG,
+@@ -477,6 +482,8 @@ int main(int argc, char *argv[])
+ 			{ "msgskip-delay", required_argument, 0, LOPT_MSGSKIP_DELAY },
+ 			{ "save-folder",   required_argument, 0, LOPT_SAVE_FOLDER },
+ 			{ "save-format",   required_argument, 0, LOPT_SAVE_FORMAT },
++			{ "upscale",       required_argument, 0, LOPT_UPSCALE },
++			{ "upscale-quality", required_argument, 0, LOPT_UPSCALE_QUALITY },
+ #ifdef DEBUGGER_ENABLED
+ 			{ "nodebug",       no_argument,       0, LOPT_NODEBUG },
+ 			{ "debug",         no_argument,       0, LOPT_DEBUG },
+@@ -551,6 +558,24 @@ int main(int argc, char *argv[])
+ 				WARNING("Invalid value for --save-format option: \"%s\"", optarg);
+ 			}
+ 			break;
++		case LOPT_UPSCALE: {
++			int mode, quality;
++			upscale_get(NULL, &quality);
++			if (upscale_parse_mode(optarg, &mode))
++				upscale_set(mode, quality);
++			else
++				WARNING("Invalid value for --upscale option: \"%s\"", optarg);
++			break;
++		}
++		case LOPT_UPSCALE_QUALITY: {
++			int mode, quality;
++			upscale_get(&mode, NULL);
++			if (upscale_parse_quality(optarg, &quality))
++				upscale_set(mode, quality);
++			else
++				WARNING("Invalid value for --upscale-quality option: \"%s\"", optarg);
++			break;
++		}
+ #ifdef DEBUGGER_ENABLED
+ 		case LOPT_NODEBUG:
+ 			dbg_enabled = false;
+diff --git a/src/upscale.c b/src/upscale.c
+new file mode 100644
+index 0000000..f906292
+--- /dev/null
++++ b/src/upscale.c
+@@ -0,0 +1,359 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#include <math.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++#include <strings.h>
++
++#include "gfx/gfx.h"
++#include "gfx/private.h"
++#include "system4.h"
++#include "upscale.h"
++
++/*
++ * Quality modes.
++ *
++ * The game surface has a fixed logical resolution, so the "render scale" of
++ * the usual FSR presets cannot be applied to the game itself. Instead the
++ * quality mode selects the resolution the upscaler works at, as a fraction
++ * of the screen viewport (never below the game's own resolution). The result
++ * is stretched the rest of the way with bilinear filtering. Lower modes do
++ * proportionally less work per frame; higher modes are closer to the screen's
++ * native resolution and therefore sharper.
++ *
++ * Sharpening is the same in every mode, using the values recommended by the
++ * upscalers' authors: FSR's RCAS at 0.2 stops, and SGSR's default edge
++ * sharpness (2.0) and edge threshold (8/255). (Measured against a ground
++ * truth image, varying these changes the result far less than the resolution
++ * does.)
++ */
++struct preset {
++	const char *name;
++	float scale;
++};
++
++static const struct preset presets[NR_UPSCALE_QUALITIES] = {
++	[UPSCALE_ULTRA_QUALITY] = { "Ultra Quality", 1.00f },
++	[UPSCALE_QUALITY]       = { "Quality",       0.85f },
++	[UPSCALE_BALANCED]      = { "Balanced",      0.70f },
++	[UPSCALE_PERFORMANCE]   = { "Performance",   0.50f },
++};
++
++#define FSR_RCAS_STOPS     0.2f
++#define SGSR_EDGE_SHARPNESS 2.0f
++#define SGSR_EDGE_THRESHOLD (8.0f / 255.0f)
++
++static const char *mode_names[NR_UPSCALE_MODES] = {
++	[UPSCALE_OFF]  = "Off",
++	[UPSCALE_FSR]  = "FSR 1.0",
++	[UPSCALE_SGSR] = "SGSR 1.0",
++};
++
++static atomic_int cfg_mode = UPSCALE_OFF;
++static atomic_int cfg_quality = UPSCALE_QUALITY;
++
++void upscale_set(int mode, int quality)
++{
++	if (mode < 0 || mode >= NR_UPSCALE_MODES)
++		mode = UPSCALE_OFF;
++	if (quality < 0 || quality >= NR_UPSCALE_QUALITIES)
++		quality = UPSCALE_QUALITY;
++	atomic_store(&cfg_mode, mode);
++	atomic_store(&cfg_quality, quality);
++}
++
++void upscale_get(int *mode, int *quality)
++{
++	if (mode)
++		*mode = atomic_load(&cfg_mode);
++	if (quality)
++		*quality = atomic_load(&cfg_quality);
++}
++
++bool upscale_parse_mode(const char *s, int *mode)
++{
++	if (!strcasecmp(s, "off") || !strcasecmp(s, "none"))
++		*mode = UPSCALE_OFF;
++	else if (!strcasecmp(s, "fsr"))
++		*mode = UPSCALE_FSR;
++	else if (!strcasecmp(s, "sgsr"))
++		*mode = UPSCALE_SGSR;
++	else
++		return false;
++	return true;
++}
++
++bool upscale_parse_quality(const char *s, int *quality)
++{
++	if (!strcasecmp(s, "ultra") || !strcasecmp(s, "ultra-quality"))
++		*quality = UPSCALE_ULTRA_QUALITY;
++	else if (!strcasecmp(s, "quality"))
++		*quality = UPSCALE_QUALITY;
++	else if (!strcasecmp(s, "balanced"))
++		*quality = UPSCALE_BALANCED;
++	else if (!strcasecmp(s, "performance"))
++		*quality = UPSCALE_PERFORMANCE;
++	else
++		return false;
++	return true;
++}
++
++/* Status text, shown in the settings UI. */
++
++static pthread_mutex_t status_lock = PTHREAD_MUTEX_INITIALIZER;
++static char status_text[256] = "Off";
++
++static void set_status(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++static void set_status(const char *fmt, ...)
++{
++	char tmp[sizeof(status_text)];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(tmp, sizeof(tmp), fmt, ap);
++	va_end(ap);
++	pthread_mutex_lock(&status_lock);
++	if (strcmp(tmp, status_text))
++		memcpy(status_text, tmp, sizeof(status_text));
++	pthread_mutex_unlock(&status_lock);
++}
++
++void upscale_status(char *buf, size_t size)
++{
++	pthread_mutex_lock(&status_lock);
++	snprintf(buf, size, "%s", status_text);
++	pthread_mutex_unlock(&status_lock);
++}
++
++/* GL resources */
++
++struct pass_shader {
++	struct shader sh;
++	const char *frag;
++	bool tried;
++	bool ok;
++	char error[256];
++	GLint u_src_size;
++	GLint u_out_size;
++	GLint u_sharpness;
++	GLint u_edge_sharpness;
++	GLint u_edge_threshold;
++};
++
++struct pass_params {
++	struct pass_shader *ps;
++	float src_w, src_h;
++	float out_w, out_h;
++	float sharpness;       // RCAS: linear
++	float edge_sharpness;  // SGSR
++	float edge_threshold;  // SGSR
++};
++
++static struct pass_shader easu_shader = { .frag = "shaders/fsr_easu.f.glsl" };
++static struct pass_shader rcas_shader = { .frag = "shaders/fsr_rcas.f.glsl" };
++static struct pass_shader sgsr_shader = { .frag = "shaders/sgsr.f.glsl" };
++
++static void pass_prepare(struct gfx_render_job *job, void *data)
++{
++	struct pass_params *p = data;
++	struct pass_shader *ps = p->ps;
++	if (ps->u_src_size >= 0)
++		glUniform2f(ps->u_src_size, p->src_w, p->src_h);
++	if (ps->u_out_size >= 0)
++		glUniform2f(ps->u_out_size, p->out_w, p->out_h);
++	if (ps->u_sharpness >= 0)
++		glUniform1f(ps->u_sharpness, p->sharpness);
++	if (ps->u_edge_sharpness >= 0)
++		glUniform1f(ps->u_edge_sharpness, p->edge_sharpness);
++	if (ps->u_edge_threshold >= 0)
++		glUniform1f(ps->u_edge_threshold, p->edge_threshold);
++}
++
++static bool shader_ready(struct pass_shader *ps)
++{
++	if (ps->tried)
++		return ps->ok;
++	ps->tried = true;
++	if (!gfx_try_load_shader(&ps->sh, "shaders/upscale.v.glsl", ps->frag,
++				 ps->error, sizeof(ps->error))) {
++		WARNING("Upscaler shader %s unavailable: %s", ps->frag, ps->error);
++		return false;
++	}
++	ps->sh.prepare = pass_prepare;
++	GLuint prog = ps->sh.program;
++	ps->u_src_size = glGetUniformLocation(prog, "u_src_size");
++	ps->u_out_size = glGetUniformLocation(prog, "u_out_size");
++	ps->u_sharpness = glGetUniformLocation(prog, "u_sharpness");
++	ps->u_edge_sharpness = glGetUniformLocation(prog, "u_edge_sharpness");
++	ps->u_edge_threshold = glGetUniformLocation(prog, "u_edge_threshold");
++	ps->ok = true;
++	return true;
++}
++
++struct target {
++	GLuint tex;
++	GLuint fbo;
++	int w, h;
++};
++
++static struct target targets[2];
++static bool targets_failed = false;
++
++static bool ensure_target(struct target *t, int w, int h)
++{
++	if (t->tex && t->w == w && t->h == h)
++		return true;
++	if (!t->tex) {
++		glGenTextures(1, &t->tex);
++		glGenFramebuffers(1, &t->fbo);
++	}
++	glActiveTexture(GL_TEXTURE0);
++	glBindTexture(GL_TEXTURE_2D, t->tex);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->tex, 0);
++	t->w = w;
++	t->h = h;
++	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++		glDeleteFramebuffers(1, &t->fbo);
++		glDeleteTextures(1, &t->tex);
++		memset(t, 0, sizeof(*t));
++		return false;
++	}
++	return true;
++}
++
++static void release_targets(void)
++{
++	for (int i = 0; i < 2; i++) {
++		if (targets[i].tex) {
++			glDeleteFramebuffers(1, &targets[i].fbo);
++			glDeleteTextures(1, &targets[i].tex);
++		}
++		memset(&targets[i], 0, sizeof(targets[i]));
++	}
++}
++
++static const GLfloat identity[16] = {
++	1, 0, 0, 0,
++	0, 1, 0, 0,
++	0, 0, 1, 0,
++	0, 0, 0, 1,
++};
++
++static void run_pass(struct pass_shader *ps, GLuint src_tex, int src_w, int src_h,
++		     struct target *dst)
++{
++	struct pass_params params = {
++		.ps = ps,
++		.src_w = src_w,
++		.src_h = src_h,
++		.out_w = dst->w,
++		.out_h = dst->h,
++		.sharpness = exp2f(-FSR_RCAS_STOPS),
++		.edge_sharpness = SGSR_EDGE_SHARPNESS,
++		.edge_threshold = SGSR_EDGE_THRESHOLD,
++	};
++	struct gfx_render_job job = {
++		.shader = &ps->sh,
++		.shape = GFX_RECTANGLE,
++		.texture = src_tex,
++		.world_transform = (GLfloat *)identity,
++		.view_transform = (GLfloat *)identity,
++		.data = &params,
++	};
++	glBindFramebuffer(GL_FRAMEBUFFER, dst->fbo);
++	glViewport(0, 0, dst->w, dst->h);
++	gfx_render(&job);
++}
++
++GLuint upscale_process(struct texture *src, int vp_w, int vp_h)
++{
++	int mode = atomic_load(&cfg_mode);
++	int quality = atomic_load(&cfg_quality);
++
++	if (mode == UPSCALE_OFF) {
++		set_status("Off");
++		return 0;
++	}
++	if (!src || !src->handle || src->w <= 0 || src->h <= 0 || vp_w <= 0 || vp_h <= 0)
++		return 0;
++	if (quality < 0 || quality >= NR_UPSCALE_QUALITIES)
++		quality = UPSCALE_QUALITY;
++	const struct preset *pr = &presets[quality];
++
++	// Resolution the upscaler runs at: a fraction of the screen viewport,
++	// but never below the game's own resolution.
++	int tw = (int)(vp_w * pr->scale + 0.5f);
++	int th = (int)(vp_h * pr->scale + 0.5f);
++	if (tw < src->w)
++		tw = src->w;
++	if (th < src->h)
++		th = src->h;
++	if (tw > vp_w)
++		tw = vp_w;
++	if (th > vp_h)
++		th = vp_h;
++
++	if (tw < src->w || th < src->h || (vp_w == src->w && vp_h == src->h)) {
++		set_status("%s: inactive (screen %dx%d is not larger than the game %dx%d)",
++			   mode_names[mode], vp_w, vp_h, src->w, src->h);
++		return 0;
++	}
++
++	struct pass_shader *first = mode == UPSCALE_FSR ? &easu_shader : &sgsr_shader;
++	bool use_rcas = mode == UPSCALE_FSR;
++	if (!shader_ready(first) || (use_rcas && !shader_ready(&rcas_shader))) {
++		struct pass_shader *bad = !first->ok ? first : &rcas_shader;
++		set_status("%s unavailable: %s", mode_names[mode], bad->error);
++		return 0;
++	}
++
++	if (targets_failed ||
++	    !ensure_target(&targets[0], tw, th) ||
++	    (use_rcas && !ensure_target(&targets[1], tw, th))) {
++		if (!targets_failed)
++			WARNING("Upscaler: failed to create render targets (%dx%d)", tw, th);
++		targets_failed = true;
++		release_targets();
++		set_status("%s unavailable: cannot create %dx%d render target", mode_names[mode], tw, th);
++		return 0;
++	}
++
++	GLboolean blend = glIsEnabled(GL_BLEND);
++	glDisable(GL_BLEND);
++
++	run_pass(first, src->handle, src->w, src->h, &targets[0]);
++	GLuint result = targets[0].tex;
++	if (use_rcas) {
++		run_pass(&rcas_shader, targets[0].tex, tw, th, &targets[1]);
++		result = targets[1].tex;
++	}
++
++	if (blend)
++		glEnable(GL_BLEND);
++
++	set_status("%s, %s: %dx%d -> %dx%d (screen %dx%d)", mode_names[mode], pr->name,
++		   src->w, src->h, tw, th, vp_w, vp_h);
++	return result;
++}
+diff --git a/src/video.c b/src/video.c
+index e1ebcd9..f8280f3 100644
+--- a/src/video.c
++++ b/src/video.c
+@@ -30,6 +30,7 @@
+ #include "gfx/gfx.h"
+ #include "gfx/private.h"
+ #include "icon.h"
++#include "upscale.h"
+ #include "xsystem4.h"
+ 
+ struct sdl_private sdl;
+@@ -133,6 +134,82 @@ void gfx_load_shader(struct shader *dst, const char *vertex_shader_path, const c
+ 	dst->prepare = NULL;
+ }
+ 
++/*
++ * Like gfx_load_shader(), but reports failure (with a message in ERR) instead
++ * of terminating. Used for optional features such as the upscalers, which
++ * must degrade gracefully on GPUs/drivers that reject their shaders.
++ */
++static GLuint try_compile_shader(const char *path, GLenum type, char *err, size_t errlen)
++{
++	GLchar *body = SDL_LoadFile(path, NULL);
++	if (!body) {
++		char full_path[PATH_MAX];
++		snprintf(full_path, PATH_MAX, XSYS4_DATA_DIR "/%s", path);
++		body = SDL_LoadFile(full_path, NULL);
++	}
++	if (!body) {
++		snprintf(err, errlen, "cannot read %s", path);
++		return 0;
++	}
++	const GLchar *source[3] = { glsl_preamble, "", body };
++	GLuint shader = glCreateShader(type);
++	glShaderSource(shader, 3, source, NULL);
++	glCompileShader(shader);
++	SDL_free(body);
++
++	GLint ok = 0;
++	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++	if (!ok) {
++		GLsizei len = 0;
++		glGetShaderInfoLog(shader, errlen, &len, err);
++		if (len <= 0)
++			snprintf(err, errlen, "compile error in %s", path);
++		glDeleteShader(shader);
++		return 0;
++	}
++	return shader;
++}
++
++bool gfx_try_load_shader(struct shader *dst, const char *vertex_shader_path,
++			 const char *fragment_shader_path, char *err, size_t errlen)
++{
++	GLuint vs = try_compile_shader(vertex_shader_path, GL_VERTEX_SHADER, err, errlen);
++	if (!vs)
++		return false;
++	GLuint fs = try_compile_shader(fragment_shader_path, GL_FRAGMENT_SHADER, err, errlen);
++	if (!fs) {
++		glDeleteShader(vs);
++		return false;
++	}
++
++	GLuint program = glCreateProgram();
++	glAttachShader(program, vs);
++	glAttachShader(program, fs);
++	glLinkProgram(program);
++	glDeleteShader(vs);
++	glDeleteShader(fs);
++
++	GLint ok = 0;
++	glGetProgramiv(program, GL_LINK_STATUS, &ok);
++	if (!ok) {
++		GLsizei len = 0;
++		glGetProgramInfoLog(program, errlen, &len, err);
++		if (len <= 0)
++			snprintf(err, errlen, "link error");
++		glDeleteProgram(program);
++		return false;
++	}
++
++	dst->program = program;
++	dst->world_transform = glGetUniformLocation(program, "world_transform");
++	dst->view_transform = glGetUniformLocation(program, "view_transform");
++	dst->texture = glGetUniformLocation(program, "tex");
++	dst->vertex_pos = glGetAttribLocation(program, "vertex_pos");
++	dst->vertex_uv = glGetAttribLocation(program, "vertex_uv");
++	dst->prepare = NULL;
++	return true;
++}
++
+ static int gl_initialize(void)
+ {
+ 	gfx_load_shader(&default_shader, "shaders/render.v.glsl", "shaders/render.f.glsl");
+@@ -423,6 +500,10 @@ static void gfx_update_frame_rate_counter(void)
+ 
+ void gfx_swap(void)
+ {
++	// Optional FSR / SGSR pass. This renders into offscreen targets, so it
++	// must run before the window framebuffer is set up below.
++	GLuint upscaled = upscale_process(view, sdl.viewport.w, sdl.viewport.h);
++
+ 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 	glViewport(sdl.viewport.x, sdl.viewport.y, sdl.viewport.w, sdl.viewport.h);
+ 	gfx_clear();
+@@ -435,7 +516,7 @@ void gfx_swap(void)
+ 	struct gfx_render_job job = {
+ 		.shader = &default_shader,
+ 		.shape = GFX_RECTANGLE,
+-		.texture = view->handle,
++		.texture = upscaled ? upscaled : view->handle,
+ 		.world_transform = mw_transform[0],
+ 		.view_transform = wv_transform[0],
+ 		.data = view
+diff --git a/src/vm.c b/src/vm.c
+index 5c0846b..866f222 100644
+--- a/src/vm.c
++++ b/src/vm.c
+@@ -32,6 +32,7 @@
+ #include "system4/string.h"
+ #include "system4/utfsjis.h"
+ 
++#include "cheat.h"
+ #include "debugger.h"
+ #include "input.h"
+ #include "savedata.h"
+@@ -2436,6 +2437,7 @@ int vm_execute_ain(struct ain *program)
+ {
+ 	ain = program;
+ 	setjmp(reset_buf);
++	cheat_init();
+ 
+ 	// initialize VM state
+ 	if (!stack) {
+@@ -2446,6 +2448,7 @@ int vm_execute_ain(struct ain *program)
+ 	call_stack_ptr = 0;
+ 
+ 	heap_init();
++	cheat_vm_reset();
+ 	init_libraries();
+ 
+ 	// Initialize globals
+@@ -2556,7 +2559,10 @@ int vm_time(void)
+ 
+ void vm_sleep(int ms)
+ {
++	// Let the cheat engine inspect the VM while the game is idle.
++	cheat_safepoint_begin();
+ 	SDL_Delay(ms);
++	cheat_safepoint_end();
+ }
+ 
+ _Noreturn void vm_exit(int code)
